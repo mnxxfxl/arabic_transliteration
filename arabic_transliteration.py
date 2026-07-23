@@ -210,6 +210,7 @@ TANWEEN_TO_VOWEL = {
 }
 IKHFA_LETTERS = set("تثجدذزسشصضطظفقك")
 TREAD_IKHFA_MARKER = "\u2060"
+_TREAD_IQLAB_MEEM = "\u06E2"
 
 # Ta marbutah vowel markers
 TA_MARBUTAH_VOWELS = {FATHA, DAMMA, KASRA, FATHATAN, DAMMATAN, KASRATAN,
@@ -253,6 +254,9 @@ CONNECTED_ARTICLE_RE = re.compile(r"([aiu])\s+a([a-z`]+-)")
 SPLIT_LONG_A_RE = re.compile(r"(?<![A-Za-z])a_a(?![A-Za-z])")
 SPACE_BEFORE_PUNCT_RE = re.compile(r"\s+([,.;:!?])")
 HORIZONTAL_SPACE_RE = re.compile(r"[ \t]+")
+_TREAD_IQLAB_VOWEL_MEEM_RE = re.compile(
+    rf"([{FATHA}{KASRA}{DAMMA}]){_TREAD_IQLAB_MEEM}(?=\s+ب)"
+)
 
 
 def _at_sentence_boundary_after(text: str, index: int) -> bool:
@@ -843,13 +847,14 @@ def _consume_nun_sakinah_idgham(
     out: List[str],
     state: _TReadState,
 ) -> Optional[int]:
-    """Handle nun-sakinah idgham before lam or ra in connected reading."""
+    """Handle nun-sakinah idgham before shaddah-bearing idgham letters."""
     ch = text[index]
     nxt = _peek(text, index + 1)
     if ch != "ن":
         return None
 
-    if nxt in {SUKUN, SUKUN2}:
+    has_explicit_sukun = nxt in {SUKUN, SUKUN2}
+    if has_explicit_sukun:
         next_idx, next_base = _next_base_index_after_for_tread(text, index + 2)
         boundary_index = index + 1
         advance = 2
@@ -862,15 +867,96 @@ def _consume_nun_sakinah_idgham(
         boundary_index = index
         advance = 1
 
+    target_has_shadda = (
+        next_idx is not None and _peek(text, next_idx + 1) == SHADDA
+    )
+    no_sukun_bigunnah_target = (
+        not has_explicit_sukun and next_base in {"و", "ي"}
+    )
+    no_sukun_shadda_target = (
+        not has_explicit_sukun
+        and next_base in {"م", "ن", "ل", "ر"}
+        and target_has_shadda
+    )
+    if (
+        not has_explicit_sukun
+        and not (no_sukun_bigunnah_target or no_sukun_shadda_target)
+    ):
+        return None
+
+    if (
+        next_base in {"ي", "ن", "م", "و"}
+        and (target_has_shadda or no_sukun_bigunnah_target)
+        and not _at_sentence_boundary_after(text, boundary_index)
+    ):
+        out.append(AR_TO_TREAD_LETTER[next_base])
+        if target_has_shadda and next_idx is not None:
+            state.suppress_shadda_at = next_idx + 1
+        return index + advance
+
     if next_base in {"ل", "ر"} and not _at_sentence_boundary_after(
         text,
         boundary_index,
     ):
         out.append(AR_TO_TREAD_LETTER[next_base] + "-")
         state.skip_spaces_before_idgham_target = True
-        if next_idx is not None and _peek(text, next_idx + 1) == SHADDA:
+        if target_has_shadda:
             state.suppress_shadda_at = next_idx + 1
         return index + advance
+
+    return None
+
+
+def _consume_meem_sakinah_idgham(
+    text: str,
+    index: int,
+    out: List[str],
+    state: _TReadState,
+) -> Optional[int]:
+    """Handle meem-sakinah assimilation before shaddah-bearing meem."""
+    if text[index] != "م":
+        return None
+
+    nxt = _peek(text, index + 1)
+    if nxt in {SUKUN, SUKUN2}:
+        next_idx, next_base = _next_base_index_after_for_tread(text, index + 2)
+        boundary_index = index + 1
+        advance = 2
+    elif nxt.isspace():
+        next_idx, next_base = _next_base_index_after_for_tread(text, index + 1)
+        boundary_index = index
+        advance = 1
+    else:
+        return None
+
+    if (
+        next_base == "م"
+        and next_idx is not None
+        and _peek(text, next_idx + 1) == SHADDA
+        and not _at_sentence_boundary_after(text, boundary_index)
+    ):
+        out.append("m")
+        state.suppress_shadda_at = next_idx + 1
+        return index + advance
+
+    return None
+
+
+def _consume_nun_sakinah_iqlab(
+    text: str,
+    index: int,
+    out: List[str],
+    state: _TReadState,
+) -> Optional[int]:
+    """Render nun sakinah as meem before ba."""
+    del state
+    if text[index] != "ن" or _peek(text, index + 1) not in {SUKUN, SUKUN2}:
+        return None
+
+    _, next_base = _next_base_index_after_for_tread(text, index + 2)
+    if next_base == "ب" and not _at_sentence_boundary_after(text, index + 1):
+        out.append("m")
+        return index + 2
 
     return None
 
@@ -981,6 +1067,32 @@ def _consume_tanween_idgham(
     if nxt_base in {"ل", "ر"} and not _at_sentence_boundary_after(text, index):
         out.append(vowel)
         state.pending_idgham_lr = AR_TO_TREAD_LETTER[nxt_base]
+        return index + _advance_after_tanween(ch, nxt)
+
+    return None
+
+
+def _consume_tanween_iqlab(
+    text: str,
+    index: int,
+    out: List[str],
+    state: _TReadState,
+) -> Optional[int]:
+    """Render the nasal element of connected tanween as meem before ba."""
+    del state
+    ch = text[index]
+    if ch not in TANWEEN_MARKS:
+        return None
+
+    nxt = _peek(text, index + 1)
+    skip_carrier = ch in {FATHATAN, OPEN_FATHATAN}
+    nxt_base = _next_base_after_for_tread(
+        text,
+        index + 1,
+        skip_fathatan_carrier=skip_carrier,
+    )
+    if nxt_base == "ب" and not _at_sentence_boundary_after(text, index):
+        out.append(TANWEEN_TO_VOWEL[ch] + "m")
         return index + _advance_after_tanween(ch, nxt)
 
     return None
@@ -1253,10 +1365,13 @@ def _append_tread_fallback(text: str, index: int, out: List[str]) -> int:
 
 
 TREAD_RULE_HANDLERS = (
+    _consume_meem_sakinah_idgham,
+    _consume_nun_sakinah_iqlab,
     _consume_nun_sakinah_idgham,
     _consume_nun_sakinah_ikhfa,
     _consume_ta_marbuta,
     _consume_dagger_alif,
+    _consume_tanween_iqlab,
     _consume_tanween_idgham,
     _consume_tanween_ikhfa,
     _consume_waqf,
@@ -1266,6 +1381,15 @@ TREAD_RULE_HANDLERS = (
     _consume_mater_lectionis,
     _consume_shadda,
 )
+
+
+def _prepare_tread_source(arabic: str) -> str:
+    """Preserve small-high-meem iqlab semantics only for T_read."""
+    source = arabic.replace("ن" + _TREAD_IQLAB_MEEM, "ن" + SUKUN2)
+    return _TREAD_IQLAB_VOWEL_MEEM_RE.sub(
+        lambda match: match.group(1) + "م" + SUKUN2,
+        source,
+    )
 
 
 def to_t_read(arabic: str) -> str:
@@ -1286,7 +1410,11 @@ def to_t_read(arabic: str) -> str:
     # T_read is not required to preserve Uthmani layout signs. Removing tatweel
     # before rule application prevents fatha + tatweel + dagger alif from being
     # expanded as a short a plus a long aa.
-    text = normalize_arabic(arabic, collapse_kemenag_alef_fatha=False).replace("\u0640", "")
+    tread_source = _prepare_tread_source(arabic)
+    text = normalize_arabic(
+        tread_source,
+        collapse_kemenag_alef_fatha=False,
+    ).replace("\u0640", "")
     out: List[str] = []
     state = _TReadState()
     i = 0
