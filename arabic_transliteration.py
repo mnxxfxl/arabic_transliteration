@@ -35,6 +35,7 @@ from typing import Dict, List, Optional, Tuple
 __all__ = [
     "ALLOW_CONVENTIONAL_T_REV_USER_INPUT",
     "SHOW_TESTS_IN_UI",
+    "UTHMANI_SILENT_WAW_DAGGER",
     "TransliterationResult",
     "normalize_arabic",
     "to_t_rev",
@@ -45,6 +46,7 @@ __all__ = [
 
 ALLOW_CONVENTIONAL_T_REV_USER_INPUT = True
 SHOW_TESTS_IN_UI = False
+UTHMANI_SILENT_WAW_DAGGER = False
 VISUAL_RTL_CONSOLE_FALLBACK = sys.platform == "win32"
 ARABIC_SCRIPT_RE = re.compile(r"[\u0600-\u06ff\u0750-\u077f\u08a0-\u08ff]")
 
@@ -114,7 +116,7 @@ AR_TO_TREV_MARK: Dict[str, str] = {
 # Consonants largely copy T_rev because T_rev has already been made QWERTY-safe.
 AR_TO_TREAD_LETTER: Dict[str, str] = {
     "ا": "",    "ب": "b",   "ت": "t",   "ث": "ts",  "ج": "j",
-    "ح": "hh",  "خ": "kh",  "د": "d",   "ذ": "dz",  "ر": "r",
+    "ح": "h",   "خ": "kh",  "د": "d",   "ذ": "dz",  "ر": "r",
     "ز": "z",   "س": "s",   "ش": "sy",  "ص": "sh",  "ض": "dh",
     "ط": "th",  "ظ": "zh",  "ع": "'",   "غ": "gh",  "ف": "f",
     "ق": "q",   "ك": "k",   "ل": "l",   "م": "m",   "ن": "n",
@@ -240,8 +242,8 @@ SUN_ARTICLE_RULES = [
     if token
     for escaped in [re.escape(token)]
     for pattern, replacement in (
-        (rf"\bwaal-{escaped}{escaped}", rf"waa{token}{token}"),
-        (rf"\bwaal-{escaped}", rf"waa{token}{token}"),
+        (rf"\bwaal-{escaped}{escaped}", rf"wa{token}{token}"),
+        (rf"\bwaal-{escaped}", rf"wa{token}{token}"),
         (rf"\bal-{escaped}{escaped}", rf"a{token}-{token}"),
         (rf"\bal-{escaped}", rf"a{token}-{token}"),
     )
@@ -410,6 +412,14 @@ def _at_word_initial(text: str, index: int) -> bool:
     )
 
 
+def _at_sentence_initial(text: str, index: int) -> bool:
+    """Return True at text start or after sentence-ending punctuation."""
+    j = index - 1
+    while j >= 0 and text[j].isspace():
+        j -= 1
+    return j < 0 or text[j] in SENTENCE_END_CHARS
+
+
 def _is_word_boundary_after(text: str, index: int) -> bool:
     """Return True if the base at index is followed by a word boundary or punctuation."""
     j = index + 1
@@ -432,7 +442,10 @@ def _is_aesthetic_or_recitation_mark(ch: str) -> bool:
         return True
     if 0x06D6 <= code <= 0x06ED and ch not in {SUKUN2, SMALL_WAW, SMALL_YEH}:
         return True
-    if 0x08D4 <= code <= 0x08FF:
+    if (
+        0x08D4 <= code <= 0x08FF
+        and ch not in {OPEN_FATHATAN, OPEN_DAMMATAN, OPEN_KASRATAN}
+    ):
         return True
     return False
 
@@ -686,7 +699,7 @@ def _apply_tread_article_rules(text: str) -> str:
         # Definite article attached to the conjunction wa-. This source form is
         # written without a space, e.g. وَالنَّاسِ. The readable output keeps
         # the familiar wa- vowel and applies sun-letter assimilation directly:
-        # wa + al-naas -> waannaas.
+        # wa + al-naas -> wannaas.
         # Most sun-letter words are already doubled by shaddah, e.g. al-rr...
         # The final pattern is a fallback for undiacritized words.
         text = pattern.sub(replacement, text)
@@ -719,11 +732,11 @@ def _apply_tread_article_rules(text: str) -> str:
 
     # General hamzat-al-wasl elision before the definite article in connected
     # reading. This applies after sun-letter assimilation has already converted
-    # forms such as al-rahhmaan into ar-rahhmaan. It joins a preceding rendered
+    # forms such as al-rahmaan into ar-rahmaan. It joins a preceding rendered
     # vowel to the article consonant while dropping only the article's initial
     # vowel. Examples:
     #   dzaalika al-kitaab   -> dzaalikal-kitaab
-    #   huwa ar-rahhmaan     -> huwar-rahhmaan
+    #   huwa ar-rahmaan      -> huwar-rahmaan
     #   birabbi an-naas      -> birabbin-naas
     text = CONNECTED_ARTICLE_RE.sub(r"\1\2", text)
     return text
@@ -995,6 +1008,31 @@ def _consume_nun_sakinah_ikhfa(
     return None
 
 
+def _consume_unmarked_consonant_idgham(
+    text: str,
+    index: int,
+    out: List[str],
+    state: _TReadState,
+) -> Optional[int]:
+    """Assimilate an unmarked final consonant into a shaddah-bearing consonant."""
+    source_token = AR_TO_TREAD_LETTER.get(text[index], "")
+    if not source_token or not _peek(text, index + 1).isspace():
+        return None
+
+    next_idx, next_base = _next_base_index_after_for_tread(text, index + 1)
+    if (
+        next_idx is None
+        or not AR_TO_TREAD_LETTER.get(next_base or "", "")
+        or _peek(text, next_idx + 1) != SHADDA
+        or _at_sentence_boundary_after(text, index)
+    ):
+        return None
+
+    out.append(AR_TO_TREAD_LETTER[next_base])
+    state.suppress_shadda_at = next_idx + 1
+    return index + 1
+
+
 def _consume_ta_marbuta(
     text: str,
     index: int,
@@ -1070,6 +1108,34 @@ def _consume_tanween_idgham(
         return index + _advance_after_tanween(ch, nxt)
 
     return None
+
+
+def _consume_fathatan_before_wasla_article(
+    text: str,
+    index: int,
+    out: List[str],
+    state: _TReadState,
+) -> Optional[int]:
+    """Render connected fathatan before an alef-wasla definite article."""
+    del state
+    ch = text[index]
+    if ch not in {FATHATAN, OPEN_FATHATAN}:
+        return None
+
+    advance = _advance_after_tanween(ch, _peek(text, index + 1))
+    article_idx = index + advance
+    while _peek(text, article_idx).isspace():
+        article_idx += 1
+
+    if (
+        _peek(text, article_idx) != ALEF_WASLA
+        or _peek(text, article_idx + 1) != "ل"
+        or _peek(text, article_idx + 2) not in {SUKUN, SUKUN2}
+    ):
+        return None
+
+    out.append("ani")
+    return index + advance
 
 
 def _consume_tanween_iqlab(
@@ -1220,6 +1286,41 @@ def _consume_definite_article(
     return j
 
 
+def _consume_sentence_initial_alef_wasla(
+    text: str,
+    index: int,
+    out: List[str],
+    state: _TReadState,
+) -> Optional[int]:
+    """Supply the initial vowel of sentence-initial alef wasla."""
+    del state
+    if text[index] != ALEF_WASLA or not _at_sentence_initial(text, index):
+        return None
+
+    second_idx = index + 1
+    if (
+        _peek(text, second_idx) not in AR_TO_TREAD_LETTER
+        or _peek(text, second_idx + 1) not in {SUKUN, SUKUN2}
+    ):
+        return None
+
+    third_idx = second_idx + 2
+    if _peek(text, third_idx) not in AR_TO_TREAD_LETTER:
+        return None
+
+    mark_idx = third_idx + 1
+    if _peek(text, mark_idx) == SHADDA:
+        mark_idx += 1
+    third_vowel = _peek(text, mark_idx)
+    if third_vowel == DAMMA:
+        out.append("u")
+    elif third_vowel in {FATHA, KASRA}:
+        out.append("i")
+    else:
+        return None
+    return index + 1
+
+
 def _consume_tread_vowel_sequence(
     text: str,
     index: int,
@@ -1231,6 +1332,8 @@ def _consume_tread_vowel_sequence(
     ch = text[index]
     nxt = _peek(text, index + 1)
     nxt2 = _peek(text, index + 2)
+    nxt3 = _peek(text, index + 3)
+    prev_base, prev_marks, _ = _prev_base_and_marks_before(text, index)
 
     if (
         ch == FATHA
@@ -1240,6 +1343,28 @@ def _consume_tread_vowel_sequence(
     ):
         out.append("a")
         return index + 1
+    if (
+        ch == FATHA
+        and nxt == "ا"
+        and AR_TO_TREAD_LETTER.get(nxt2, "")
+        and nxt3 in {SUKUN, SUKUN2}
+        and AR_TO_TREAD_LETTER.get(prev_base or "", "")
+        and prev_base not in {"ى", "آ"}
+        and SHADDA not in prev_marks
+    ):
+        out.append("a")
+        return index + 2
+    if (
+        UTHMANI_SILENT_WAW_DAGGER
+        and ch == FATHA
+        and nxt == "و"
+        and nxt2 == DAGGER_ALEF
+    ):
+        out.append("aa")
+        return index + 3
+    if ch == DAGGER_ALEF and nxt == "ى":
+        out.append("aa")
+        return index + 2
     if ch == FATHA and nxt in {"ا", "ى"} and nxt2 == FATHA:
         out.append("a a")
         return index + 3
@@ -1323,6 +1448,29 @@ def _consume_mater_lectionis(
     return None
 
 
+def _consume_unmarked_adjacent_consonant(
+    text: str,
+    index: int,
+    out: List[str],
+    state: _TReadState,
+) -> Optional[int]:
+    """Omit an unmarked consonant before a short-vowelled consonant."""
+    del out, state
+    if (
+        text[index] in {"ى", "آ"}
+        or not AR_TO_TREAD_LETTER.get(text[index], "")
+    ):
+        return None
+
+    next_base = _peek(text, index + 1)
+    if (
+        not AR_TO_TREAD_LETTER.get(next_base, "")
+        or _peek(text, index + 2) not in {FATHA, KASRA, DAMMA}
+    ):
+        return None
+    return index + 1
+
+
 def _consume_shadda(
     text: str,
     index: int,
@@ -1370,15 +1518,19 @@ TREAD_RULE_HANDLERS = (
     _consume_nun_sakinah_idgham,
     _consume_nun_sakinah_ikhfa,
     _consume_ta_marbuta,
+    _consume_unmarked_consonant_idgham,
     _consume_dagger_alif,
+    _consume_fathatan_before_wasla_article,
     _consume_tanween_iqlab,
     _consume_tanween_idgham,
     _consume_tanween_ikhfa,
     _consume_waqf,
     _consume_allah_name,
     _consume_definite_article,
+    _consume_sentence_initial_alef_wasla,
     _consume_tread_vowel_sequence,
     _consume_mater_lectionis,
+    _consume_unmarked_adjacent_consonant,
     _consume_shadda,
 )
 
